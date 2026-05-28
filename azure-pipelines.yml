@@ -1,0 +1,176 @@
+trigger:
+- master
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: Sonar
+  - group: SNYK
+  - name: ACR_NAME
+    value: 'myacr123'
+  - name: ACR_LOGIN_SERVER
+    value: 'myacr123.azurecr.io'
+  - name: IMAGE_NAME
+    value: 'nodejs-shopping-cart'
+  - name: IMAGE_TAG
+    value: '$(Build.BuildId)'
+
+stages:
+- stage: CI
+  displayName: 'Continuous Integration'
+
+  jobs:
+  - job: Build_Scan_Push
+    displayName: 'Build Scan Push Docker Image'
+
+    steps:
+
+    # =========================
+    # CHECKOUT CODE
+    # =========================
+    - checkout: self
+
+    # =========================
+    # INSTALL NODEJS
+    # =========================
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '18.x'
+      displayName: 'Install NodeJS'
+
+    # =========================
+    # INSTALL DEPENDENCIES
+    # =========================
+    - script: |
+        node -v
+        npm -v
+        npm install
+      displayName: 'Install Dependencies'
+
+    # =========================
+    # INSTALL JAVA 17
+    # =========================
+    - task: JavaToolInstaller@0
+      inputs:
+        versionSpec: '17'
+        jdkArchitectureOption: 'x64'
+        jdkSourceOption: 'PreInstalled'
+      displayName: 'Install Java 17'
+
+    # =========================
+    # SONARCLOUD PREPARE
+    # =========================
+    - task: SonarCloudPrepare@3
+      displayName: 'Prepare SonarCloud Analysis'
+      inputs:
+        SonarCloud: 'SonarCloud'
+        organization: 'kk1996sai'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: 'nodejs-shopping-cart'
+        cliProjectName: 'nodejs-shopping-cart'
+        cliSources: '.'
+        extraProperties: |
+          sonar.scanner.javaVersion=17
+
+    # =========================
+    # SONARCLOUD ANALYSIS
+    # =========================
+    - task: SonarCloudAnalyze@3
+      displayName: 'Run SonarCloud Analysis'
+
+    # =========================
+    # SONARCLOUD PUBLISH
+    # =========================
+    - task: SonarCloudPublish@3
+      displayName: 'Publish SonarCloud Results'
+      inputs:
+        pollingTimeoutSec: '300'
+
+    # =========================
+    # INSTALL SNYK
+    # =========================
+    - script: |
+        npm install -g snyk
+      displayName: 'Install Snyk'
+
+    # =========================
+    # SNYK AUTH
+    # =========================
+    - script: |
+        snyk auth $SNYK_TOKEN
+      displayName: 'Snyk Authentication'
+      env:
+        SNYK_TOKEN: $(SNYK_TOKEN)
+
+    # =========================
+    # SNYK SCAN
+    # =========================
+    - script: |
+        snyk test --severity-threshold=high || true
+      displayName: 'Snyk SCA Scan'
+      env:
+        SNYK_TOKEN: $(SNYK_TOKEN)
+
+    # =========================
+    # DOCKER BUILD
+    # =========================
+    - task: Docker@2
+      displayName: 'Build Docker Image'
+      inputs:
+        command: 'build'
+        Dockerfile: '$(System.DefaultWorkingDirectory)/Dockerfile'
+        repository: '$(IMAGE_NAME)'
+        tags: |
+          $(IMAGE_TAG)
+          latest
+
+    # =========================
+    # INSTALL TRIVY
+    # =========================
+    - script: |
+        sudo apt-get update
+        sudo apt-get install wget apt-transport-https gnupg lsb-release -y
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update
+        sudo apt-get install trivy -y
+      displayName: 'Install Trivy'
+
+    # =========================
+    # TRIVY IMAGE SCAN
+    # =========================
+    - script: |
+        trivy image --severity HIGH,CRITICAL --exit-code 0 $(IMAGE_NAME):$(IMAGE_TAG)
+      displayName: 'Trivy Image Scan'
+
+    # =========================
+    # LOGIN TO AZURE & ACR
+    # =========================
+    - task: AzureCLI@2
+      displayName: 'Login to Azure & ACR'
+      inputs:
+        azureSubscription: 'azure-service-connection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          ACR_USERNAME=$(az acr credential show --name $(ACR_NAME) --resource-group aks-rg --query username -o tsv)
+          ACR_PASSWORD=$(az acr credential show --name $(ACR_NAME) --resource-group aks-rg --query "passwords[0].value" -o tsv)
+          echo $ACR_PASSWORD | docker login $(ACR_LOGIN_SERVER) --username $ACR_USERNAME --password-stdin
+
+    # =========================
+    # TAG IMAGE
+    # =========================
+    - script: |
+        docker tag $(IMAGE_NAME):$(IMAGE_TAG) $(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)
+        docker tag $(IMAGE_NAME):$(IMAGE_TAG) $(ACR_LOGIN_SERVER)/$(IMAGE_NAME):latest
+      displayName: 'Tag Docker Image'
+
+    # =========================
+    # PUSH IMAGE TO ACR
+    # =========================
+    - script: |
+        docker push $(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)
+        docker push $(ACR_LOGIN_SERVER)/$(IMAGE_NAME):latest
+      displayName: 'Push Docker Image to ACR'
